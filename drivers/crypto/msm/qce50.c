@@ -1,6 +1,6 @@
 /* Qualcomm Crypto Engine driver.
  *
- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -101,6 +101,13 @@ struct qce_device {
 	dma_addr_t phy_ota_src;
 	dma_addr_t phy_ota_dst;
 	unsigned int ota_size;
+
+	bool use_sw_aes_cbc_ecb_ctr_algo;
+	bool use_sw_aead_algo;
+	bool use_sw_aes_xts_algo;
+	bool use_sw_ahash_algo;
+	bool use_sw_hmac_algo;
+	bool use_sw_aes_ccm_algo;
 };
 
 /* Standard initialization vector for SHA-1, source: FIPS 180-2 */
@@ -277,31 +284,38 @@ static int _ce_setup_hash(struct qce_device *pce_dev,
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 	bool sha1 = false;
 	struct sps_command_element *pce = NULL;
+	bool use_hw_key = false;
+	bool use_pipe_key = false;
+	uint32_t authk_size_in_word = sreq->authklen/sizeof(uint32_t);
+	uint32_t auth_cfg;
 
 	if ((sreq->alg == QCE_HASH_SHA1_HMAC) ||
 			(sreq->alg == QCE_HASH_SHA256_HMAC) ||
 			(sreq->alg ==  QCE_HASH_AES_CMAC)) {
-		uint32_t authk_size_in_word = sreq->authklen/sizeof(uint32_t);
 
-		_byte_stream_to_net_words(mackey32, sreq->authkey,
-						sreq->authklen);
 
-		/* check for null key. If null, use hw key*/
-		for (i = 0; i < authk_size_in_word; i++) {
-			if (mackey32[i] != 0)
-				break;
-		}
-
+		/* no more check for null key. use flag */
+		if ((sreq->flags & QCRYPTO_CTX_USE_HW_KEY)
+						== QCRYPTO_CTX_USE_HW_KEY)
+			use_hw_key = true;
+		else if ((sreq->flags & QCRYPTO_CTX_USE_PIPE_KEY) ==
+						QCRYPTO_CTX_USE_PIPE_KEY)
+			use_pipe_key = true;
 		pce = cmdlistinfo->go_proc;
-		if (i == authk_size_in_word) {
+		if (use_hw_key == true) {
 			pce->addr = (uint32_t)(CRYPTO_GOPROC_QC_KEY_REG +
 							pce_dev->phy_iobase);
 		} else {
 			pce->addr = (uint32_t)(CRYPTO_GOPROC_REG +
 							pce_dev->phy_iobase);
 			pce = cmdlistinfo->auth_key;
-			for (i = 0; i < authk_size_in_word; i++, pce++)
-				pce->data = mackey32[i];
+			if (use_pipe_key == false) {
+				_byte_stream_to_net_words(mackey32,
+						sreq->authkey,
+						sreq->authklen);
+				for (i = 0; i < authk_size_in_word; i++, pce++)
+					pce->data = mackey32[i];
+			}
 		}
 	}
 
@@ -356,14 +370,19 @@ static int _ce_setup_hash(struct qce_device *pce_dev,
 
 	/* Set/reset  last bit in CFG register  */
 	pce = cmdlistinfo->auth_seg_cfg;
+	auth_cfg = pce->data & ~(1 << CRYPTO_LAST |
+				1 << CRYPTO_FIRST |
+				1 << CRYPTO_USE_PIPE_KEY_AUTH |
+				1 << CRYPTO_USE_HW_KEY_AUTH);
 	if (sreq->last_blk)
-		pce->data |= 1 << CRYPTO_LAST;
-	else
-		pce->data &= ~(1 << CRYPTO_LAST);
+		auth_cfg |= 1 << CRYPTO_LAST;
 	if (sreq->first_blk)
-		pce->data |= 1 << CRYPTO_FIRST;
-	else
-		pce->data &= ~(1 << CRYPTO_FIRST);
+		auth_cfg |= 1 << CRYPTO_FIRST;
+	if (use_hw_key)
+		auth_cfg |= 1 << CRYPTO_USE_HW_KEY_AUTH;
+	if (use_pipe_key)
+		auth_cfg |= 1 << CRYPTO_USE_PIPE_KEY_AUTH;
+	pce->data = auth_cfg;
 go_proc:
 	/* write auth seg size */
 	pce = cmdlistinfo->auth_seg_size;
@@ -452,7 +471,7 @@ static int _ce_setup_aead(struct qce_device *pce_dev, struct qce_req *q_req,
 		uint32_t totallen_in, uint32_t coffset,
 		struct qce_cmdlist_info *cmdlistinfo)
 {
-	int32_t authk_size_in_word = q_req->authklen/sizeof(uint32_t);
+	int32_t authk_size_in_word = SHA_HMAC_KEY_SIZE/sizeof(uint32_t);
 	int i;
 	uint32_t mackey32[SHA_HMAC_KEY_SIZE/sizeof(uint32_t)] = {0};
 	struct sps_command_element *pce;
@@ -813,12 +832,20 @@ static int _ce_setup_cipher(struct qce_device *pce_dev, struct qce_req *creq,
 			}
 			/* write xts du size */
 			pce = cmdlistinfo->encr_xts_du_size;
-			if (!(creq->flags & QCRYPTO_CTX_XTS_MASK))
-				pce->data = creq->cryptlen;
-			else
+			switch (creq->flags & QCRYPTO_CTX_XTS_MASK) {
+			case QCRYPTO_CTX_XTS_DU_SIZE_512B:
 				pce->data = min((unsigned int)QCE_SECTOR_SIZE,
 						creq->cryptlen);
-
+				break;
+			case QCRYPTO_CTX_XTS_DU_SIZE_1KB:
+				pce->data =
+					min((unsigned int)QCE_SECTOR_SIZE * 2,
+					creq->cryptlen);
+				break;
+			default:
+				pce->data = creq->cryptlen;
+				break;
+			}
 		}
 		if (creq->mode !=  QCE_MODE_ECB) {
 			if (creq->mode ==  QCE_MODE_XTS)
@@ -1028,9 +1055,11 @@ static int _ce_setup_hash_direct(struct qce_device *pce_dev,
 	uint32_t auth32[SHA256_DIGEST_SIZE / sizeof(uint32_t)];
 	uint32_t diglen;
 	bool use_hw_key = false;
+	bool use_pipe_key = false;
 	int i;
 	uint32_t mackey32[SHA_HMAC_KEY_SIZE/sizeof(uint32_t)] = {
 			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+	uint32_t authk_size_in_word = sreq->authklen/sizeof(uint32_t);
 	bool sha1 = false;
 	uint32_t auth_cfg = 0;
 
@@ -1077,25 +1106,25 @@ static int _ce_setup_hash_direct(struct qce_device *pce_dev,
 	if ((sreq->alg == QCE_HASH_SHA1_HMAC) ||
 			(sreq->alg == QCE_HASH_SHA256_HMAC) ||
 			(sreq->alg ==  QCE_HASH_AES_CMAC)) {
-		uint32_t authk_size_in_word = sreq->authklen/sizeof(uint32_t);
 
 		_byte_stream_to_net_words(mackey32, sreq->authkey,
 						sreq->authklen);
 
-		/* check for null key. If null, use hw key*/
-		for (i = 0; i < authk_size_in_word; i++) {
-			if (mackey32[i] != 0)
-				break;
-		}
+		/* no more check for null key. use flag to check*/
 
-		if (i == authk_size_in_word)
+		if ((sreq->flags & QCRYPTO_CTX_USE_HW_KEY) ==
+					QCRYPTO_CTX_USE_HW_KEY) {
 			use_hw_key = true;
-		else
-			/* Clear auth_ivn, auth_keyn registers  */
+		} else if ((sreq->flags & QCRYPTO_CTX_USE_PIPE_KEY) ==
+						QCRYPTO_CTX_USE_PIPE_KEY) {
+			use_pipe_key = true;
+		} else {
+			/* setup key */
 			for (i = 0; i < authk_size_in_word; i++)
 				writel_relaxed(mackey32[i], (pce_dev->iobase +
 					(CRYPTO_AUTH_KEY0_REG +
 							i*sizeof(uint32_t))));
+		}
 	}
 
 	if (sreq->alg ==  QCE_HASH_AES_CMAC)
@@ -1169,6 +1198,10 @@ static int _ce_setup_hash_direct(struct qce_device *pce_dev,
 		auth_cfg |= 1 << CRYPTO_FIRST;
 	else
 		auth_cfg &= ~(1 << CRYPTO_FIRST);
+	if (use_hw_key)
+		auth_cfg |= 1 << CRYPTO_USE_HW_KEY_AUTH;
+	if (use_pipe_key)
+		auth_cfg |= 1 << CRYPTO_USE_PIPE_KEY_AUTH;
 go_proc:
 	 /* write seg_cfg */
 	writel_relaxed(auth_cfg, pce_dev->iobase + CRYPTO_AUTH_SEG_CFG_REG);
@@ -1204,7 +1237,7 @@ go_proc:
 static int _ce_setup_aead_direct(struct qce_device *pce_dev,
 		struct qce_req *q_req, uint32_t totallen_in, uint32_t coffset)
 {
-	int32_t authk_size_in_word = q_req->authklen/sizeof(uint32_t);
+	int32_t authk_size_in_word = SHA_HMAC_KEY_SIZE/sizeof(uint32_t);
 	int i;
 	uint32_t mackey32[SHA_HMAC_KEY_SIZE/sizeof(uint32_t)] = {0};
 	uint32_t a_cfg;
@@ -1587,15 +1620,25 @@ static int _ce_setup_cipher_direct(struct qce_device *pce_dev,
 						(i * sizeof(uint32_t)));
 			}
 			/* write xts du size */
-			if (use_pipe_key == true)
-				writel_relaxed(min((uint32_t)QCE_SECTOR_SIZE,
-						creq->cryptlen),
-						pce_dev->iobase +
-						CRYPTO_ENCR_XTS_DU_SIZE_REG);
-			else
-				writel_relaxed(creq->cryptlen ,
-						pce_dev->iobase +
-						CRYPTO_ENCR_XTS_DU_SIZE_REG);
+			switch (creq->flags & QCRYPTO_CTX_XTS_MASK) {
+			case QCRYPTO_CTX_XTS_DU_SIZE_512B:
+				writel_relaxed(
+					min((uint32_t)QCE_SECTOR_SIZE,
+					creq->cryptlen), pce_dev->iobase +
+					CRYPTO_ENCR_XTS_DU_SIZE_REG);
+				break;
+			case QCRYPTO_CTX_XTS_DU_SIZE_1KB:
+				writel_relaxed(
+					min((uint32_t)(QCE_SECTOR_SIZE * 2),
+					creq->cryptlen), pce_dev->iobase +
+					CRYPTO_ENCR_XTS_DU_SIZE_REG);
+				break;
+			default:
+				writel_relaxed(creq->cryptlen,
+					pce_dev->iobase +
+					CRYPTO_ENCR_XTS_DU_SIZE_REG);
+				break;
+			}
 		}
 		if (creq->mode !=  QCE_MODE_ECB) {
 			if (creq->mode ==  QCE_MODE_XTS)
@@ -5042,6 +5085,26 @@ static int __qce_get_device_tree_data(struct platform_device *pdev,
 				"qcom,ce-hw-shared");
 	pce_dev->support_hw_key = of_property_read_bool((&pdev->dev)->of_node,
 				"qcom,ce-hw-key");
+
+	pce_dev->use_sw_aes_cbc_ecb_ctr_algo =
+				of_property_read_bool((&pdev->dev)->of_node,
+				"qcom,use-sw-aes-cbc-ecb-ctr-algo");
+	pce_dev->use_sw_aead_algo =
+				of_property_read_bool((&pdev->dev)->of_node,
+				"qcom,use-sw-aead-algo");
+	pce_dev->use_sw_aes_xts_algo =
+				of_property_read_bool((&pdev->dev)->of_node,
+				"qcom,use-sw-aes-xts-algo");
+	pce_dev->use_sw_ahash_algo =
+				of_property_read_bool((&pdev->dev)->of_node,
+				"qcom,use-sw-ahash-algo");
+	pce_dev->use_sw_hmac_algo =
+				of_property_read_bool((&pdev->dev)->of_node,
+				"qcom,use-sw-hmac-algo");
+	pce_dev->use_sw_aes_ccm_algo =
+				of_property_read_bool((&pdev->dev)->of_node,
+				"qcom,use-sw-aes-ccm-algo");
+
 	if (of_property_read_u32((&pdev->dev)->of_node,
 				"qcom,bam-pipe-pair",
 				&pce_dev->ce_sps.pipe_pair_index)) {
@@ -5373,6 +5436,19 @@ int qce_hw_support(void *handle, struct ce_hw_support *ce_support)
 		ce_support->aligned_only = false;
 	else
 		ce_support->aligned_only = true;
+
+	ce_support->use_sw_aes_cbc_ecb_ctr_algo =
+				pce_dev->use_sw_aes_cbc_ecb_ctr_algo;
+	ce_support->use_sw_aead_algo =
+				pce_dev->use_sw_aead_algo;
+	ce_support->use_sw_aes_xts_algo =
+				pce_dev->use_sw_aes_xts_algo;
+	ce_support->use_sw_ahash_algo =
+				pce_dev->use_sw_ahash_algo;
+	ce_support->use_sw_hmac_algo =
+				pce_dev->use_sw_hmac_algo;
+	ce_support->use_sw_aes_ccm_algo =
+				pce_dev->use_sw_aes_ccm_algo;
 	return 0;
 }
 EXPORT_SYMBOL(qce_hw_support);
